@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 if [ "$#" -lt 2 ]; then
     echo "failed: missing input paramenters"

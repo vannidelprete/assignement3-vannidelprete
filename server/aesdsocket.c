@@ -330,7 +330,11 @@ void *timer_thread(void *arg)
         int data_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (data_fd != -1)
         {
-            write(data_fd, timestamp, strlen(timestamp));
+            ssize_t bytes_written = write(data_fd, timestamp, strlen(timestamp));
+            if (bytes_written == -1)
+            {
+                syslog(LOG_ERR, "Timer thread: failed to write timestamp: %s", strerror(errno));
+            }
             close(data_fd);
         }
         else

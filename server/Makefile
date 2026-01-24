@@ -21,7 +21,7 @@ all: $(TARGET)
 
 # Build target
 $(TARGET): $(OBJS)
-	$(CROSS_COMPILE)$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) -lpthread
+	$(CROSS_COMPILE)$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJS) -lpthread
 
 # Compile source files
 %.o: %.c

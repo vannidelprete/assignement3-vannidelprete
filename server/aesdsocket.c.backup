@@ -1,4 +1,5 @@
-#define _GNU_SOURCE
+#include <asm-generic/errno-base.h>
+#include <asm-generic/socket.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,39 +15,16 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include <time.h>
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
-#define TIMER_INTERVAL_SEC 10
 
 // Global variables for signal handling
 static volatile bool signal_received = false;
 static int server_fd = -1;
-static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int data_fd = -1;
 
-// Thread data structure for client connections
-typedef struct thread_node
-{
-    pthread_t thread_id;
-    int client_fd;
-    struct sockaddr_in client_addr;
-    bool thread_complete;
-    struct thread_node *next;
-} thread_node_t;
-
-// Timer thread data
-typedef struct
-{
-    pthread_t thread_id;
-    bool active;
-} timer_data_t;
-
-// Head of the linked list
-static thread_node_t *thread_list_head = NULL;
-static pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void signal_handler(int signo)
 {
@@ -78,53 +56,26 @@ int setup_signal_handlers(void)
     return 0;
 }
 
-void cleanup_threads(void)
-{
-    pthread_mutex_lock(&list_mutex);
-
-    thread_node_t *current = thread_list_head;
-    thread_node_t *next;
-
-    while (current != NULL)
-    {
-        next = current->next;
-
-        // Joint the thread if not already joined
-        if (!current->thread_complete)
-        {
-            pthread_join(current->thread_id, NULL);
-        }
-
-        if (current->client_fd != 1)
-        {
-            close(current->client_fd);
-        }
-
-        free(current);
-        current = next;
-    }
-
-    thread_list_head = NULL;
-    pthread_mutex_unlock(&list_mutex);
-}
-
 void cleanup(void)
 {
-    cleanup_threads();
-
     if (server_fd != -1)
     {
         close(server_fd);
         server_fd = -1;
     }
 
+    if (data_fd != -1)
+    {
+        close(data_fd);
+        data_fd = -1;
+    }
+
+    // Delete the data file
     if (unlink(DATA_FILE) == -1 && errno != ENOENT)
     {
         syslog(LOG_ERR, "Failed to delete data file: %s", strerror(errno));
     }
 
-    pthread_mutex_destroy(&file_mutex);
-    pthread_mutex_destroy(&list_mutex);
     closelog();
 }
 
@@ -180,21 +131,18 @@ int daemonize(void)
     return 0;
 }
 
-void *handle_connection(void *arg)
+int handle_connection(int client_fd)
 {
-    thread_node_t *node = (thread_node_t *)arg;
-    int client_fd = node->client_fd;
     char buffer[BUFFER_SIZE];
     size_t bytes_received;
     bool packet_complete = false;
-    int data_fd = -1;
 
+    // Open data file in append mode
     data_fd = open(DATA_FILE, O_CREAT | O_RDWR | O_APPEND, 0644);
     if (data_fd == -1)
     {
         syslog(LOG_ERR, "Failed to open data file: %s", strerror(errno));
-        node->thread_complete = true;
-        return NULL;
+        return -1;
     }
 
     // Receive data from client
@@ -206,8 +154,8 @@ void *handle_connection(void *arg)
         {
             syslog(LOG_ERR, "recv failed: %s", strerror(errno));
             close(data_fd);
-            node->thread_complete = true;
-            return NULL;
+            data_fd = -1;
+            return -1;
         }
 
         if (bytes_received == 0)
@@ -216,21 +164,17 @@ void *handle_connection(void *arg)
             break;
         }
 
-        // Lock mutex before writing to file
-        pthread_mutex_lock(&file_mutex);
         ssize_t bytes_written = write(data_fd, buffer, bytes_received);
-        pthread_mutex_unlock(&file_mutex);
-
-        if (bytes_written != (ssize_t)bytes_received)
+        if (bytes_written != bytes_received)
         {
             syslog(LOG_ERR, "Failed to write to data file: %s", strerror(errno));
             close(data_fd);
-            node->thread_complete = true;
-            return NULL;
+            data_fd = -1;
+            return -1;
         }
 
         // Check if packet is complete (contains newline)
-        for (size_t i = 0; i < bytes_received; i++)
+        for (ssize_t i = 0; i < bytes_received; i++)
         {
             if (buffer[i] == '\n')
             {
@@ -245,20 +189,8 @@ void *handle_connection(void *arg)
         }
     }
 
-    close(data_fd);
-
     // Send file contents back to client
-    // Lock mutex before reading to ensure consistency
-    pthread_mutex_lock(&file_mutex);
-
-    data_fd = open(DATA_FILE, O_RDONLY);
-    if (data_fd == -1)
-    {
-        syslog(LOG_ERR, "Failed to open data file for reading: %s", strerror(errno));
-        pthread_mutex_unlock(&file_mutex);
-        node->thread_complete = true;
-        return NULL;
-    }
+    lseek(data_fd, 0, SEEK_SET);
 
     while (!signal_received)
     {
@@ -268,9 +200,8 @@ void *handle_connection(void *arg)
         {
             syslog(LOG_ERR, "Failed to read from data file: %s", strerror(errno));
             close(data_fd);
-            pthread_mutex_unlock(&file_mutex);
-            node->thread_complete = true;
-            return NULL;
+            data_fd = -1;
+            return -1;
         }
 
         if (bytes_read == 0)
@@ -282,130 +213,26 @@ void *handle_connection(void *arg)
         ssize_t bytes_sent = send(client_fd, buffer, bytes_read, 0);
         if (bytes_sent != bytes_read)
         {
-            syslog(LOG_ERR, "Send failed: %s", strerror(errno));
+            syslog(LOG_ERR, "send failed: %s", strerror(errno));
             close(data_fd);
-            pthread_mutex_unlock(&file_mutex);
-            node->thread_complete = true;
-            return NULL;
+            data_fd = -1;
+            return -1;
         }
     }
 
     close(data_fd);
-    pthread_mutex_unlock(&file_mutex);
+    data_fd = -1;
 
-    // Log closed connection
-    char* client_ip = inet_ntoa(node->client_addr.sin_addr);
-    syslog(LOG_INFO, "Closed connection from %s", client_ip);
-
-    node->thread_complete = true;
-    return NULL;
-}
-
-void *timer_thread(void *arg)
-{
-    timer_data_t* timer_data = (timer_data_t*)arg;
-    char timestamp[200];
-    time_t now;
-    struct tm* timeinfo;
-
-    while (!signal_received && timer_data->active)
-    {
-        sleep(TIMER_INTERVAL_SEC);
-
-        if (signal_received || !timer_data->active)
-        {
-            break;
-        }
-
-        // Get current time
-        time(&now);
-        timeinfo = localtime(&now);
-
-        // Format timestamp according to RFC 2822
-        strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", timeinfo);
-
-        // Write timestamp to file with mutex protection
-        pthread_mutex_lock(&file_mutex);
-
-        int data_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if (data_fd != -1)
-        {
-            write(data_fd, timestamp, strlen(timestamp));
-            close(data_fd);
-        }
-        else
-        {
-            syslog(LOG_ERR, "Timer thread: Failed to open data file: %s", strerror(errno));
-        }
-
-        pthread_mutex_unlock(&file_mutex);
-    }
-
-    return NULL;
-}
-
-void add_thread_to_list(thread_node_t *node)
-{
-    pthread_mutex_lock(&list_mutex);
-
-    node->next = thread_list_head;
-    thread_list_head = node;
-
-    pthread_mutex_unlock(&list_mutex);
-}
-
-void join_completed_threads(void)
-{
-    pthread_mutex_lock(&list_mutex);
-
-    thread_node_t *current = thread_list_head;
-    thread_node_t *prev = NULL;
-
-    while (current != NULL)
-    {
-        if (current->thread_complete)
-        {
-            // Joint the completed thread
-            pthread_join(current->thread_id, NULL);
-
-            // Close client socket
-            if (current->client_fd != -1)
-            {
-                close(current->client_fd);
-                current->client_fd = -1;
-            }
-
-            // Remove from list
-            if (prev == NULL)
-            {
-                thread_list_head = current->next;
-            }
-            else
-            {
-                prev->next = current->next;
-            }
-
-            thread_node_t *to_free = current;
-            current = current->next;
-            free(to_free);
-        }
-        else
-        {
-            prev = current;
-            current = current->next;
-        }
-    }
-
-    pthread_mutex_unlock(&list_mutex);
+    return 0;
 }
 
 int main(int argc, char* argv[])
 {
+    int client_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     int opt = 1;
     bool daemon_mode = false;
-    timer_data_t timer_data = {0};
 
     // Opening syslog
     openlog("aesdsocket", LOG_PID, LOG_USER);
@@ -476,23 +303,11 @@ int main(int argc, char* argv[])
 
     syslog(LOG_INFO, "Server listening on port %d", PORT);
 
-    // Start timer thread
-    timer_data.active = true;
-    if (pthread_create(&timer_data.thread_id, NULL, timer_thread, &timer_data) != 0)
-    {
-        syslog(LOG_ERR, "Failed to create timer thread: %s", strerror(errno));
-        cleanup();
-        return -1;
-    }
-
     // Main server loop
     while (!signal_received)
     {
-        // Join any completed threads
-        join_completed_threads();
-
         // Accept connection
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
+        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
 
         if (client_fd == -1)
         {
@@ -505,38 +320,17 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        // Log accepted connection
         char* client_ip = inet_ntoa(client_addr.sin_addr);
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        // Create thread node
-        thread_node_t* node = malloc(sizeof(thread_node_t));
-        if (node == NULL)
-        {
-            syslog(LOG_ERR, "Failed to allocate thread node");
-            close(client_fd);
-            continue;
-        }
+        // Handle connection
+        handle_connection(client_fd);
 
-        node->client_fd = client_fd;
-        node->client_addr = client_addr;
-        node->thread_complete = false;
-        node->next = NULL;
+        syslog(LOG_INFO, "Closed connection from %s", client_ip);
 
-        // Create thread for this connection
-        if (pthread_create(&node->thread_id, NULL, handle_connection, node) != 0)
-        {
-            syslog(LOG_ERR, "Failed to create thread: %s", strerror(errno));
-            close(client_fd);
-            free(node);
-            continue;
-        }
-
-        add_thread_to_list(node);
+        close(client_fd);
     }
-
-    // Signal timer thread to stop
-    timer_data.active = false;
-    pthread_join(timer_data.thread_id, NULL);
 
     cleanup();
     return 0;

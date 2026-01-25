@@ -245,6 +245,7 @@ void *handle_connection(void *arg)
         }
     }
 
+    fsync(data_fd);
     close(data_fd);
 
     // Send file contents back to client
